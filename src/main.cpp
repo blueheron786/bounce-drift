@@ -3,6 +3,7 @@
 #include <gba_sound.h>
 #include <gba_systemcalls.h>
 #include <gba_interrupt.h>
+#include <gba_dma.h>
 
 // Constants
 #define SCREEN_WIDTH 240
@@ -24,6 +25,9 @@
 #define MAX_VELOCITY INT_TO_FIXED(8)
 #define BOUNCE_DAMPING (FIXED_ONE * 8 / 10)
 #define NUDGE_FORCE INT_TO_FIXED(2)
+
+// Back buffer in external work RAM
+#define BACK_BUFFER ((u16*)0x02000000)
 
 // Game structures
 struct Ball {
@@ -55,7 +59,7 @@ int numBricks;
 
 void drawPixel(int x, int y, u16 color) {
     if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT) {
-        ((u16*)VRAM)[y * SCREEN_WIDTH + x] = color;
+        BACK_BUFFER[y * SCREEN_WIDTH + x] = color;
     }
 }
 
@@ -78,10 +82,14 @@ void drawCircle(int centerX, int centerY, int radius, u16 color) {
 }
 
 void clearScreen() {
-    u16* vram = (u16*)VRAM;
     for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
-        vram[i] = BACKGROUND_COLOR;
+        BACK_BUFFER[i] = BACKGROUND_COLOR;
     }
+}
+
+void copyToVRAM() {
+    // Use DMA3 for fast memory copy
+    dmaCopy(BACK_BUFFER, (void*)VRAM, SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(u16));
 }
 
 void initGame() {
@@ -253,7 +261,6 @@ void updateBall() {
 }
 
 void render() {
-    VBlankIntrWait();
     clearScreen();
     
     // Draw launcher
@@ -280,6 +287,10 @@ void render() {
         drawCircle(FIXED_TO_INT(ball.x), FIXED_TO_INT(ball.y), 
                   ball.radius, BALL_COLOR);
     }
+    
+    // Wait for VBlank and copy to VRAM
+    VBlankIntrWait();
+    copyToVRAM();
 }
 
 int main() {
