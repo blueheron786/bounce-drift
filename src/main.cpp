@@ -1,183 +1,304 @@
-#include <gba.h>
 #include <gba_video.h>
 #include <gba_input.h>
 #include <gba_sound.h>
 #include <gba_systemcalls.h>
 #include <gba_interrupt.h>
 
-// Player struct
-struct Player {
+// Constants
+#define SCREEN_WIDTH 240
+#define SCREEN_HEIGHT 160
+#define BACKGROUND_COLOR RGB5(0, 0, 8)
+#define BALL_COLOR RGB5(31, 31, 31)
+#define BRICK_COLOR RGB5(31, 15, 0)
+#define LAUNCHER_COLOR RGB5(15, 31, 15)
+#define CHARGE_BAR_COLOR RGB5(31, 31, 0)
+
+// Fixed point math (16.16)
+#define FIXED_SHIFT 16
+#define FIXED_ONE (1 << FIXED_SHIFT)
+#define INT_TO_FIXED(x) ((x) << FIXED_SHIFT)
+#define FIXED_TO_INT(x) ((x) >> FIXED_SHIFT)
+
+// Physics constants
+#define GRAVITY INT_TO_FIXED(1) / 16
+#define MAX_VELOCITY INT_TO_FIXED(8)
+#define BOUNCE_DAMPING (FIXED_ONE * 8 / 10)
+#define NUDGE_FORCE INT_TO_FIXED(2)
+
+// Game structures
+struct Ball {
+    int x, y;        // Fixed point
+    int vx, vy;      // Fixed point velocity
+    int radius;
+    bool active;
+};
+
+struct Brick {
     int x, y;
-    int w, h;
+    int width, height;
+    bool active;
     u16 color;
 };
 
-// Static obstacle positions
-struct Obstacle {
+struct Launcher {
     int x, y;
-    int w, h;
-    u16 color;
+    int width, height;
+    int charge;      // 0-100
+    bool charging;
 };
 
-// Function to draw a filled rectangle
-void drawRect(u16* fb, int x, int y, int w, int h, u16 color) {
-    for (int dy = 0; dy < h; ++dy) {
-        for (int dx = 0; dx < w; ++dx) {
-            if (x + dx >= 0 && x + dx < 240 && y + dy >= 0 && y + dy < 160) {
-                fb[(y + dy) * 240 + (x + dx)] = color;
+// Game state
+Ball ball;
+Brick bricks[20];
+Launcher launcher;
+int numBricks;
+
+void drawPixel(int x, int y, u16 color) {
+    if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT) {
+        ((u16*)VRAM)[y * SCREEN_WIDTH + x] = color;
+    }
+}
+
+void drawRect(int x, int y, int width, int height, u16 color) {
+    for (int dy = 0; dy < height; dy++) {
+        for (int dx = 0; dx < width; dx++) {
+            drawPixel(x + dx, y + dy, color);
+        }
+    }
+}
+
+void drawCircle(int centerX, int centerY, int radius, u16 color) {
+    for (int y = -radius; y <= radius; y++) {
+        for (int x = -radius; x <= radius; x++) {
+            if (x*x + y*y <= radius*radius) {
+                drawPixel(centerX + x, centerY + y, color);
             }
         }
     }
 }
 
-// AABB collision detection
-bool checkCollision(const Player& player, const Obstacle& obs) {
-    return player.x < obs.x + obs.w &&
-           player.x + player.w > obs.x &&
-           player.y < obs.y + obs.h &&
-           player.y + player.h > obs.y;
+void clearScreen() {
+    u16* vram = (u16*)VRAM;
+    for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
+        vram[i] = BACKGROUND_COLOR;
+    }
 }
 
-// Simple sound effect (beep)
-void playThudSound() {
-    // Set up sound channel 1 for a simple square wave
-    REG_SOUND1CNT_L = 0x0040; // Sweep off
-    REG_SOUND1CNT_H = 0x8000 | (0 << 6); // Square wave, duty cycle 12.5%
-    REG_SOUND1CNT_X = 0x8400 | (1000); // Enable, frequency ~1000Hz
+void initGame() {
+    // Initialize ball
+    ball.x = INT_TO_FIXED(200);
+    ball.y = INT_TO_FIXED(120);
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.radius = 3;
+    ball.active = false;
+    
+    // Initialize launcher
+    launcher.x = 200;
+    launcher.y = 50;
+    launcher.width = 30;
+    launcher.height = 80;
+    launcher.charge = 0;
+    launcher.charging = false;
+    
+    // Initialize bricks
+    numBricks = 0;
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 5; col++) {
+            if (numBricks < 20) {
+                bricks[numBricks].x = col * 40 + 10;
+                bricks[numBricks].y = row * 15 + 20;
+                bricks[numBricks].width = 35;
+                bricks[numBricks].height = 12;
+                bricks[numBricks].active = true;
+                bricks[numBricks].color = RGB5(31 - col * 5, row * 7, 15);
+                numBricks++;
+            }
+        }
+    }
 }
 
-// Draw button states
-void drawButtons(u16* fb, u16 keys) {
-    u16 grey = RGB5(15, 15, 15);
-    u16 blue = RGB5(0, 15, 31);
+void handleInput() {
+    scanKeys();
+    u16 keys = keysHeld();
+    u16 keysPressed = keysDown();
     
-    // A button (right)
-    drawRect(fb, 200, 120, 16, 16, (keys & KEY_A) ? blue : grey);
+    // Handle charging
+    if (keys & KEY_A && !ball.active) {
+        launcher.charging = true;
+        if (launcher.charge < 100) {
+            launcher.charge += 2;
+        }
+    } else if (launcher.charging) {
+        // Release - launch ball
+        ball.active = true;
+        ball.x = INT_TO_FIXED(launcher.x - 10);
+        ball.y = INT_TO_FIXED(launcher.y + launcher.height / 2);
+        ball.vx = -(launcher.charge * INT_TO_FIXED(6)) / 100;
+        ball.vy = -(launcher.charge * INT_TO_FIXED(4)) / 100;
+        launcher.charge = 0;
+        launcher.charging = false;
+        
+        // Play launch sound
+        REG_SOUND1CNT_L = 0x0040;
+        REG_SOUND1CNT_H = 0x8000 | (7 << 12);
+        REG_SOUND1CNT_X = 0x8000 | (1024 - 262);
+    }
     
-    // B button (left of A)
-    drawRect(fb, 180, 130, 16, 16, (keys & KEY_B) ? blue : grey);
+    // Handle nudging during ball flight
+    if (ball.active) {
+        if (keysPressed & KEY_UP) {
+            ball.vy -= NUDGE_FORCE;
+        }
+        if (keysPressed & KEY_DOWN) {
+            ball.vy += NUDGE_FORCE;
+        }
+        if (keysPressed & KEY_LEFT) {
+            ball.vx -= NUDGE_FORCE;
+        }
+        if (keysPressed & KEY_RIGHT) {
+            ball.vx += NUDGE_FORCE;
+        }
+    }
+}
+
+void handleWallCollisions() {
+    if (!ball.active) return;
     
-    // L button (top left)
-    drawRect(fb, 10, 10, 20, 8, (keys & KEY_L) ? blue : grey);
+    int ballX = FIXED_TO_INT(ball.x);
+    int ballY = FIXED_TO_INT(ball.y);
     
-    // R button (top right)
-    drawRect(fb, 210, 10, 20, 8, (keys & KEY_R) ? blue : grey);
+    // Left/right walls
+    if (ballX <= ball.radius) {
+        ball.x = INT_TO_FIXED(ball.radius);
+        ball.vx = -ball.vx;
+        ball.vx = (ball.vx * BOUNCE_DAMPING) >> FIXED_SHIFT;
+    } else if (ballX >= SCREEN_WIDTH - ball.radius) {
+        ball.x = INT_TO_FIXED(SCREEN_WIDTH - ball.radius);
+        ball.vx = -ball.vx;
+        ball.vx = (ball.vx * BOUNCE_DAMPING) >> FIXED_SHIFT;
+    }
+    
+    // Top wall
+    if (ballY <= ball.radius) {
+        ball.y = INT_TO_FIXED(ball.radius);
+        ball.vy = -ball.vy;
+        ball.vy = (ball.vy * BOUNCE_DAMPING) >> FIXED_SHIFT;
+    }
+    
+    // Bottom wall - reset ball
+    if (ballY >= SCREEN_HEIGHT + 20) {
+        ball.active = false;
+        ball.vx = 0;
+        ball.vy = 0;
+    }
+}
+
+bool ballBrickCollision(Ball* b, Brick* brick) {
+    if (!b->active || !brick->active) return false;
+    
+    int ballX = FIXED_TO_INT(b->x);
+    int ballY = FIXED_TO_INT(b->y);
+    
+    int closestX = ballX;
+    int closestY = ballY;
+    
+    if (ballX < brick->x) closestX = brick->x;
+    else if (ballX > brick->x + brick->width) closestX = brick->x + brick->width;
+    
+    if (ballY < brick->y) closestY = brick->y;
+    else if (ballY > brick->y + brick->height) closestY = brick->y + brick->height;
+    
+    int dx = ballX - closestX;
+    int dy = ballY - closestY;
+    
+    return (dx * dx + dy * dy) <= (b->radius * b->radius);
+}
+
+void updateBall() {
+    if (!ball.active) return;
+    
+    // Apply gravity
+    ball.vy += GRAVITY;
+    
+    // Limit velocity
+    if (ball.vx > MAX_VELOCITY) ball.vx = MAX_VELOCITY;
+    if (ball.vx < -MAX_VELOCITY) ball.vx = -MAX_VELOCITY;
+    if (ball.vy > MAX_VELOCITY) ball.vy = MAX_VELOCITY;
+    if (ball.vy < -MAX_VELOCITY) ball.vy = -MAX_VELOCITY;
+    
+    // Update position
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+    
+    // Handle wall collisions
+    handleWallCollisions();
+    
+    // Check brick collisions
+    for (int i = 0; i < numBricks; i++) {
+        if (ballBrickCollision(&ball, &bricks[i])) {
+            bricks[i].active = false;
+            
+            // Simple bounce
+            ball.vy = -ball.vy;
+            ball.vx = (ball.vx * BOUNCE_DAMPING) >> FIXED_SHIFT;
+            ball.vy = (ball.vy * BOUNCE_DAMPING) >> FIXED_SHIFT;
+            
+            // Play hit sound
+            REG_SOUND2CNT_L = 0x8040;
+            REG_SOUND2CNT_H = 0x8000 | (6 << 12) | (1 << 6);
+            break;
+        }
+    }
+}
+
+void render() {
+    VBlankIntrWait();
+    clearScreen();
+    
+    // Draw launcher
+    drawRect(launcher.x, launcher.y, launcher.width, launcher.height, LAUNCHER_COLOR);
+    
+    // Draw charge bar
+    if (launcher.charging && launcher.charge > 0) {
+        int barHeight = (launcher.charge * launcher.height) / 100;
+        drawRect(launcher.x + launcher.width + 5, 
+                 launcher.y + launcher.height - barHeight, 
+                 5, barHeight, CHARGE_BAR_COLOR);
+    }
+    
+    // Draw bricks
+    for (int i = 0; i < numBricks; i++) {
+        if (bricks[i].active) {
+            drawRect(bricks[i].x, bricks[i].y, 
+                    bricks[i].width, bricks[i].height, bricks[i].color);
+        }
+    }
+    
+    // Draw ball
+    if (ball.active) {
+        drawCircle(FIXED_TO_INT(ball.x), FIXED_TO_INT(ball.y), 
+                  ball.radius, BALL_COLOR);
+    }
 }
 
 int main() {
-    // Set video mode 3 (bitmap) and background 2
     REG_DISPCNT = MODE_3 | BG2_ENABLE;
-    
-    // Initialize input system
     irqInit();
     irqEnable(IRQ_VBLANK);
     
-    // Enable sound
-    REG_SOUNDCNT_X = 0x0080; // Master sound enable
-    REG_SOUNDCNT_L = 0x1177; // Enable all channels
-    REG_SOUNDCNT_H = 0x0002; // Sound A/B to 100%, timer 0/1
+    // Initialize sound
+    REG_SOUNDCNT_X = 0x80;
+    REG_SOUNDCNT_L = 0xFF77;
+    REG_SOUNDCNT_H = 2;
     
-    u16* fb = (u16*)VRAM;
-    
-    // Initialize player (blue block)
-    Player player = {120, 80, 16, 16, RGB5(0, 15, 31)};
-    
-    // Initialize obstacles (white blocks)
-    Obstacle obstacles[] = {
-        {50, 50, 20, 20, RGB5(31, 31, 31)},
-        {180, 60, 20, 20, RGB5(31, 31, 31)},
-        {100, 120, 20, 20, RGB5(31, 31, 31)},
-        {160, 30, 20, 20, RGB5(31, 31, 31)}
-    };
-    int numObstacles = sizeof(obstacles) / sizeof(obstacles[0]);
-    
-    Player oldPlayer = player;
-    u16 oldKeys = 0;
-    
-    // Initial screen clear
-    for (int i = 0; i < 240 * 160; i++) {
-        fb[i] = RGB5(0, 0, 0);
-    }
-    
-    // Draw initial obstacles
-    for (int i = 0; i < numObstacles; i++) {
-        drawRect(fb, obstacles[i].x, obstacles[i].y, obstacles[i].w, obstacles[i].h, obstacles[i].color);
-    }
-    
-    // Draw initial player
-    drawRect(fb, player.x, player.y, player.w, player.h, player.color);
-    
-    // Draw initial button states (all grey)
-    drawButtons(fb, 0);
+    initGame();
     
     while (1) {
-        VBlankIntrWait(); // Wait for VBlank first to reduce flicker
-        
-        // Read input
-        scanKeys();
-        u16 keys = keysHeld();
-        
-        // Store old position for collision handling
-        oldPlayer = player;
-        
-        // Move player with WASD (using D-pad)
-        if (keys & KEY_LEFT) player.x -= 2;
-        if (keys & KEY_RIGHT) player.x += 2;
-        if (keys & KEY_UP) player.y -= 2;
-        if (keys & KEY_DOWN) player.y += 2;
-        
-        // Keep player on screen
-        if (player.x < 0) player.x = 0;
-        if (player.x > 240 - player.w) player.x = 240 - player.w;
-        if (player.y < 0) player.y = 0;
-        if (player.y > 160 - player.h) player.y = 160 - player.h;
-        
-        // Check collisions with obstacles
-        bool collided = false;
-        for (int i = 0; i < numObstacles; i++) {
-            if (checkCollision(player, obstacles[i])) {
-                // Collision detected - revert to old position and play sound
-                player = oldPlayer;
-                playThudSound();
-                collided = true;
-                break;
-            }
-        }
-        
-        // Only redraw if player moved
-        if (player.x != oldPlayer.x || player.y != oldPlayer.y) {
-            // Erase old player position
-            drawRect(fb, oldPlayer.x, oldPlayer.y, oldPlayer.w, oldPlayer.h, RGB5(0, 0, 0));
-            
-            // Redraw any obstacles that might have been erased
-            for (int i = 0; i < numObstacles; i++) {
-                if (oldPlayer.x < obstacles[i].x + obstacles[i].w &&
-                    oldPlayer.x + oldPlayer.w > obstacles[i].x &&
-                    oldPlayer.y < obstacles[i].y + obstacles[i].h &&
-                    oldPlayer.y + oldPlayer.h > obstacles[i].y) {
-                    drawRect(fb, obstacles[i].x, obstacles[i].y, obstacles[i].w, obstacles[i].h, obstacles[i].color);
-                }
-            }
-            
-            // Draw player at new position
-            drawRect(fb, player.x, player.y, player.w, player.h, player.color);
-        }
-        
-        // Only redraw buttons if keys changed
-        if (keys != oldKeys) {
-            // Erase old button area (just clear the button regions)
-            drawRect(fb, 200, 120, 16, 16, RGB5(0, 0, 0)); // A
-            drawRect(fb, 180, 130, 16, 16, RGB5(0, 0, 0)); // B  
-            drawRect(fb, 10, 10, 20, 8, RGB5(0, 0, 0));    // L
-            drawRect(fb, 210, 10, 20, 8, RGB5(0, 0, 0));   // R
-            
-            // Draw buttons with new state
-            drawButtons(fb, keys);
-            oldKeys = keys;
-        }
-        
-        // Update old player position
-        oldPlayer = player;
+        handleInput();
+        updateBall();
+        render();
     }
+    
     return 0;
 }

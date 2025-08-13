@@ -15,7 +15,7 @@ OBJ = $(SRC:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
  CFLAGS = -I$(LIBGBA)/include -Iinclude -mthumb -mthumb-interwork -O2
 LDFLAGS = -mthumb -mthumb-interwork -specs=gba.specs -L$(LIBGBA)/lib -lgba
 
-TARGET = hello
+TARGET = bouncedrift
 OUT_DIR = build/obj/output
 ELF = $(OUT_DIR)/$(TARGET).elf
 BIN = $(OUT_DIR)/$(TARGET).gba
