@@ -115,7 +115,7 @@ void initGame() {
             if (numBricks < 20) {
                 bricks[numBricks].x = col * 35 + 15;  // Left side of screen
                 bricks[numBricks].y = row * 12 + 100; // Below launcher (y=100-148)
-                bricks[numBricks].width = 30;
+                bricks[numBricks].width = 20;  // Narrower blocks (was 30)
                 bricks[numBricks].height = 8;  // Shorter blocks
                 bricks[numBricks].active = true;
                 bricks[numBricks].color = RGB5(31 - col * 5, row * 7, 15);
@@ -146,10 +146,10 @@ void handleInput() {
         launcher.charge = 0;
         launcher.charging = false;
         
-        // Play launch sound
-        REG_SOUND1CNT_L = 0x0040;
-        REG_SOUND1CNT_H = 0x8000 | (7 << 12);
-        REG_SOUND1CNT_X = 0x8000 | (1024 - 262);
+        // Play launch sound - short burst
+        REG_SOUND1CNT_L = 0x0020;  // Shorter envelope
+        REG_SOUND1CNT_H = 0x8000 | (4 << 12);  // Lower duty cycle
+        REG_SOUND1CNT_X = 0x8000 | (1800);  // Higher frequency, shorter duration
     }
     
     // Handle nudging during ball flight - gentler control
@@ -259,20 +259,45 @@ void updateBall() {
     // Check brick collisions
     for (int i = 0; i < numBricks; i++) {
         if (ballBrickCollision(&ball, &bricks[i])) {
+            // Simple physics - determine collision direction and invert appropriate velocity
+            int ballX = FIXED_TO_INT(ball.x);
+            int ballY = FIXED_TO_INT(ball.y);
+            int brickCenterX = bricks[i].x + bricks[i].width / 2;
+            int brickCenterY = bricks[i].y + bricks[i].height / 2;
+            
+            // Calculate relative position to brick center
+            int dx = ballX - brickCenterX;
+            int dy = ballY - brickCenterY;
+            
+            // Use absolute values to compare distances
+            int absDx = dx < 0 ? -dx : dx;
+            int absDy = dy < 0 ? -dy : dy;
+            
+            // If horizontal distance is greater, it's a side hit (invert X)
+            // If vertical distance is greater, it's a top/bottom hit (invert Y)
+            if (absDx > absDy) {
+                // Side hit - invert horizontal velocity with more force
+                ball.vx = -ball.vx;
+                ball.vx = (ball.vx * 110) / 100;  // Add 10% energy to make bounce obvious
+            } else {
+                // Top/bottom hit - invert vertical velocity with more force
+                ball.vy = -ball.vy;
+                ball.vy = (ball.vy * 110) / 100;  // Add 10% energy to make bounce obvious
+            }
+            
+            // Apply less damping so bounce is more visible
+            ball.vx = (ball.vx * 90) / 100;  // Only 10% energy loss instead of BOUNCE_DAMPING
+            ball.vy = (ball.vy * 90) / 100;
+            
             // Clear the brick area immediately when destroyed
             drawRect(bricks[i].x, bricks[i].y, 
                     bricks[i].width, bricks[i].height, BACKGROUND_COLOR);
             
             bricks[i].active = false;
             
-            // Simple bounce
-            ball.vy = -ball.vy;
-            ball.vx = (ball.vx * BOUNCE_DAMPING) >> FIXED_SHIFT;
-            ball.vy = (ball.vy * BOUNCE_DAMPING) >> FIXED_SHIFT;
-            
-            // Play hit sound
-            REG_SOUND2CNT_L = 0x8040;
-            REG_SOUND2CNT_H = 0x8000 | (6 << 12) | (1 << 6);
+            // Play hit sound - short blip
+            REG_SOUND2CNT_L = 0x8020;  // Shorter envelope
+            REG_SOUND2CNT_H = 0x8000 | (3 << 12) | (1 << 6);  // Lower duty, shorter
             break;
         }
     }
