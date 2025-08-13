@@ -20,10 +20,10 @@
 #define FIXED_TO_INT(x) ((x) >> FIXED_SHIFT)
 
 // Physics constants
-#define GRAVITY INT_TO_FIXED(1) / 4     // Increased from /16 to /4
-#define MAX_VELOCITY INT_TO_FIXED(12)   // Increased from 8 to 12
-#define BOUNCE_DAMPING (FIXED_ONE * 9 / 10)  // Less damping
-#define NUDGE_FORCE INT_TO_FIXED(3)     // Increased from 2 to 3
+#define GRAVITY INT_TO_FIXED(1) / 12    // Slower gravity
+#define MAX_VELOCITY INT_TO_FIXED(6)    // Much slower max speed
+#define BOUNCE_DAMPING (FIXED_ONE * 8 / 10)  // Less damping for more lively bounces
+#define NUDGE_FORCE INT_TO_FIXED(3)     // Reduced nudge force
 
 // Track ball position for selective clearing
 int lastBallX = -1, lastBallY = -1;
@@ -137,12 +137,12 @@ void handleInput() {
             launcher.charge += 4;  // Increased from 2 to 4 for faster charging
         }
     } else if (launcher.charging) {
-        // Release - launch ball
+        // Release - launch ball with slower, more manageable velocity
         ball.active = true;
         ball.x = INT_TO_FIXED(launcher.x - 10);
         ball.y = INT_TO_FIXED(launcher.y + launcher.height / 2);
-        ball.vx = -(launcher.charge * INT_TO_FIXED(12)) / 100;  // Increased from 6 to 12
-        ball.vy = -(launcher.charge * INT_TO_FIXED(8)) / 100;   // Increased from 4 to 8
+        ball.vx = -(launcher.charge * INT_TO_FIXED(5)) / 100;   // Reduced from 8 to 5
+        ball.vy = -(launcher.charge * INT_TO_FIXED(3)) / 100;   // Reduced from 4 to 3
         launcher.charge = 0;
         launcher.charging = false;
         
@@ -152,19 +152,34 @@ void handleInput() {
         REG_SOUND1CNT_X = 0x8000 | (1024 - 262);
     }
     
-    // Handle nudging during ball flight
+    // Handle nudging during ball flight - gentler control
     if (ball.active) {
+        // Use keysHeld for very gentle continuous nudging
+        if (keys & KEY_UP) {
+            ball.vy -= NUDGE_FORCE / 4;  // Much smaller continuous nudge
+        }
+        if (keys & KEY_DOWN) {
+            ball.vy += NUDGE_FORCE / 4;
+        }
+        if (keys & KEY_LEFT) {
+            ball.vx -= NUDGE_FORCE / 4;
+        }
+        if (keys & KEY_RIGHT) {
+            ball.vx += NUDGE_FORCE / 4;
+        }
+        
+        // Moderate nudges on key press
         if (keysPressed & KEY_UP) {
-            ball.vy -= NUDGE_FORCE;
+            ball.vy -= NUDGE_FORCE / 2;  // Reduced force
         }
         if (keysPressed & KEY_DOWN) {
-            ball.vy += NUDGE_FORCE;
+            ball.vy += NUDGE_FORCE / 2;
         }
         if (keysPressed & KEY_LEFT) {
-            ball.vx -= NUDGE_FORCE;
+            ball.vx -= NUDGE_FORCE / 2;
         }
         if (keysPressed & KEY_RIGHT) {
-            ball.vx += NUDGE_FORCE;
+            ball.vx += NUDGE_FORCE / 2;
         }
     }
 }
@@ -244,6 +259,10 @@ void updateBall() {
     // Check brick collisions
     for (int i = 0; i < numBricks; i++) {
         if (ballBrickCollision(&ball, &bricks[i])) {
+            // Clear the brick area immediately when destroyed
+            drawRect(bricks[i].x, bricks[i].y, 
+                    bricks[i].width, bricks[i].height, BACKGROUND_COLOR);
+            
             bricks[i].active = false;
             
             // Simple bounce
@@ -287,15 +306,40 @@ void render() {
         }
     }
     
-    // Draw ball with selective clearing
+    // Draw ball with selective clearing that respects other objects
     if (ball.active) {
         int currentBallX = FIXED_TO_INT(ball.x);
         int currentBallY = FIXED_TO_INT(ball.y);
         
-        // Clear old ball position if it moved
+        // Clear old ball position if it moved, but only if not overlapping objects
         if (lastBallX != -1 && lastBallY != -1 && 
             (lastBallX != currentBallX || lastBallY != currentBallY)) {
-            drawCircle(lastBallX, lastBallY, ball.radius, BACKGROUND_COLOR);
+            
+            // Check if old ball position overlaps with any active bricks
+            bool overlapsBrick = false;
+            for (int i = 0; i < numBricks; i++) {
+                if (bricks[i].active) {
+                    // Check if old ball position overlaps this brick
+                    if (lastBallX + ball.radius >= bricks[i].x && 
+                        lastBallX - ball.radius <= bricks[i].x + bricks[i].width &&
+                        lastBallY + ball.radius >= bricks[i].y && 
+                        lastBallY - ball.radius <= bricks[i].y + bricks[i].height) {
+                        overlapsBrick = true;
+                        break;
+                    }
+                }
+            }
+            
+            // Check if old ball position overlaps launcher
+            bool overlapsLauncher = (lastBallX + ball.radius >= launcher.x && 
+                                   lastBallX - ball.radius <= launcher.x + launcher.width &&
+                                   lastBallY + ball.radius >= launcher.y && 
+                                   lastBallY - ball.radius <= launcher.y + launcher.height);
+            
+            // Only clear if not overlapping any objects
+            if (!overlapsBrick && !overlapsLauncher) {
+                drawCircle(lastBallX, lastBallY, ball.radius, BACKGROUND_COLOR);
+            }
         }
         
         // Draw new ball position
@@ -305,7 +349,7 @@ void render() {
         lastBallX = currentBallX;
         lastBallY = currentBallY;
     } else {
-        // Clear ball when not active
+        // Clear ball when not active, but only if safe
         if (lastBallX != -1 && lastBallY != -1) {
             drawCircle(lastBallX, lastBallY, ball.radius, BACKGROUND_COLOR);
             lastBallX = -1;
