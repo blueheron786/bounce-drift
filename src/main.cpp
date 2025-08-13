@@ -3,7 +3,6 @@
 #include <gba_sound.h>
 #include <gba_systemcalls.h>
 #include <gba_interrupt.h>
-#include <gba_dma.h>
 
 // Constants
 #define SCREEN_WIDTH 240
@@ -21,13 +20,13 @@
 #define FIXED_TO_INT(x) ((x) >> FIXED_SHIFT)
 
 // Physics constants
-#define GRAVITY INT_TO_FIXED(1) / 16
-#define MAX_VELOCITY INT_TO_FIXED(8)
-#define BOUNCE_DAMPING (FIXED_ONE * 8 / 10)
-#define NUDGE_FORCE INT_TO_FIXED(2)
+#define GRAVITY INT_TO_FIXED(1) / 4     // Increased from /16 to /4
+#define MAX_VELOCITY INT_TO_FIXED(12)   // Increased from 8 to 12
+#define BOUNCE_DAMPING (FIXED_ONE * 9 / 10)  // Less damping
+#define NUDGE_FORCE INT_TO_FIXED(3)     // Increased from 2 to 3
 
-// Back buffer in external work RAM
-#define BACK_BUFFER ((u16*)0x02000000)
+// Track ball position for selective clearing
+int lastBallX = -1, lastBallY = -1;
 
 // Game structures
 struct Ball {
@@ -59,7 +58,7 @@ int numBricks;
 
 void drawPixel(int x, int y, u16 color) {
     if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT) {
-        BACK_BUFFER[y * SCREEN_WIDTH + x] = color;
+        ((u16*)VRAM)[y * SCREEN_WIDTH + x] = color;
     }
 }
 
@@ -82,14 +81,14 @@ void drawCircle(int centerX, int centerY, int radius, u16 color) {
 }
 
 void clearScreen() {
-    for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
-        BACK_BUFFER[i] = BACKGROUND_COLOR;
+    // Clear VRAM directly for speed
+    u32* vram32 = (u32*)VRAM;
+    u32 clearColor = (BACKGROUND_COLOR << 16) | BACKGROUND_COLOR;
+    int words = (SCREEN_WIDTH * SCREEN_HEIGHT) / 2;
+    
+    for (int i = 0; i < words; i++) {
+        *vram32++ = clearColor;
     }
-}
-
-void copyToVRAM() {
-    // Use DMA3 for fast memory copy
-    dmaCopy(BACK_BUFFER, (void*)VRAM, SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(u16));
 }
 
 void initGame() {
@@ -109,15 +108,15 @@ void initGame() {
     launcher.charge = 0;
     launcher.charging = false;
     
-    // Initialize bricks
+    // Initialize bricks - positioned below ball launch area
     numBricks = 0;
     for (int row = 0; row < 4; row++) {
         for (int col = 0; col < 5; col++) {
             if (numBricks < 20) {
-                bricks[numBricks].x = col * 40 + 10;
-                bricks[numBricks].y = row * 15 + 20;
-                bricks[numBricks].width = 35;
-                bricks[numBricks].height = 12;
+                bricks[numBricks].x = col * 35 + 15;  // Left side of screen
+                bricks[numBricks].y = row * 12 + 100; // Below launcher (y=100-148)
+                bricks[numBricks].width = 30;
+                bricks[numBricks].height = 8;  // Shorter blocks
                 bricks[numBricks].active = true;
                 bricks[numBricks].color = RGB5(31 - col * 5, row * 7, 15);
                 numBricks++;
@@ -135,15 +134,15 @@ void handleInput() {
     if (keys & KEY_A && !ball.active) {
         launcher.charging = true;
         if (launcher.charge < 100) {
-            launcher.charge += 2;
+            launcher.charge += 4;  // Increased from 2 to 4 for faster charging
         }
     } else if (launcher.charging) {
         // Release - launch ball
         ball.active = true;
         ball.x = INT_TO_FIXED(launcher.x - 10);
         ball.y = INT_TO_FIXED(launcher.y + launcher.height / 2);
-        ball.vx = -(launcher.charge * INT_TO_FIXED(6)) / 100;
-        ball.vy = -(launcher.charge * INT_TO_FIXED(4)) / 100;
+        ball.vx = -(launcher.charge * INT_TO_FIXED(12)) / 100;  // Increased from 6 to 12
+        ball.vy = -(launcher.charge * INT_TO_FIXED(8)) / 100;   // Increased from 4 to 8
         launcher.charge = 0;
         launcher.charging = false;
         
@@ -261,7 +260,10 @@ void updateBall() {
 }
 
 void render() {
-    clearScreen();
+    VBlankIntrWait();  // Wait for VBlank first
+    
+    // Idiomatic GBA: overdraw without clearing (faster)
+    // Background objects will naturally cover old pixels
     
     // Draw launcher
     drawRect(launcher.x, launcher.y, launcher.width, launcher.height, LAUNCHER_COLOR);
@@ -272,6 +274,9 @@ void render() {
         drawRect(launcher.x + launcher.width + 5, 
                  launcher.y + launcher.height - barHeight, 
                  5, barHeight, CHARGE_BAR_COLOR);
+    } else {
+        // Clear charge bar area when not charging
+        drawRect(launcher.x + launcher.width + 5, launcher.y, 5, launcher.height, BACKGROUND_COLOR);
     }
     
     // Draw bricks
@@ -282,15 +287,31 @@ void render() {
         }
     }
     
-    // Draw ball
+    // Draw ball with selective clearing
     if (ball.active) {
-        drawCircle(FIXED_TO_INT(ball.x), FIXED_TO_INT(ball.y), 
-                  ball.radius, BALL_COLOR);
+        int currentBallX = FIXED_TO_INT(ball.x);
+        int currentBallY = FIXED_TO_INT(ball.y);
+        
+        // Clear old ball position if it moved
+        if (lastBallX != -1 && lastBallY != -1 && 
+            (lastBallX != currentBallX || lastBallY != currentBallY)) {
+            drawCircle(lastBallX, lastBallY, ball.radius, BACKGROUND_COLOR);
+        }
+        
+        // Draw new ball position
+        drawCircle(currentBallX, currentBallY, ball.radius, BALL_COLOR);
+        
+        // Update last position
+        lastBallX = currentBallX;
+        lastBallY = currentBallY;
+    } else {
+        // Clear ball when not active
+        if (lastBallX != -1 && lastBallY != -1) {
+            drawCircle(lastBallX, lastBallY, ball.radius, BACKGROUND_COLOR);
+            lastBallX = -1;
+            lastBallY = -1;
+        }
     }
-    
-    // Wait for VBlank and copy to VRAM
-    VBlankIntrWait();
-    copyToVRAM();
 }
 
 int main() {
@@ -304,6 +325,9 @@ int main() {
     REG_SOUNDCNT_H = 2;
     
     initGame();
+    
+    // Clear screen once at startup (idiomatic GBA)
+    clearScreen();
     
     while (1) {
         handleInput();
